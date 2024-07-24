@@ -1,0 +1,149 @@
+image: maven:3.9-eclipse-temurin-11
+
+pipelines:
+ 
+  branches:
+    develop:
+      - step:
+          name: Run Unit Test
+          caches:
+            - maven
+          script:
+            - sed -i "s/9999/${BITBUCKET_BUILD_NUMBER}/g" ./pom.xml  # update application version using 'BITBUCKET_BUILD_NUMBER'
+            - mvn clean -P cloudhub2  --settings ./scripts/settings.xml # separate 'mvn clean' to avoid 'object generation error in .git directory' error
+            - mvn test -P cloudhub2 -Denv=dev -Denc.key=${enc_key}  --settings ./scripts/settings.xml
+      - step:
+          name: Deploy to DEV
+          deployment: DEV
+          caches:
+            - maven
+          script:
+            - sed -i "s/9999/${BITBUCKET_BUILD_NUMBER}/g" ./pom.xml  # update application version using 'BITBUCKET_BUILD_NUMBER'
+            - mvn clean -P cloudhub2 --settings ./scripts/settings.xml # separate 'mvn clean' to avoid 'object generation error in .git directory' error
+            - mvn clean deploy -P cloudhub2 -Denv=dev -Denc.key=${enc_key} --settings ./scripts/settings.xml
+            - mvn clean deploy -P cloudhub2 -e -DmuleDeploy -DskipTests -Danypoint.environment=DEV -Denv=dev -Denc.key=${enc_key} --settings ./scripts/settings.xml
+           # pipeline variable : anypoint_connected_app_id / anypoint_connected_app_secret / anypoint_platform_client_id / anypoint_platform_client_secret / nexus_username / nexus_password
+                
+      - step:
+          name: Deploy to TEST
+          trigger: manual
+          deployment: TEST
+          caches:
+            - maven
+          script:
+            - sed -i "s/9999/${BITBUCKET_BUILD_NUMBER}/g" ./pom.xml 
+            - mvn clean deploy -P cloudhub2 -e -DmuleDeploy -DskipTests -Danypoint.environment=TEST -Denv=test -Denc.key=${enc_key}  --settings ./scripts/settings.xml
+           # pipeline variable : anypoint_connected_app_id / anypoint_connected_app_secret / anypoint_platform_client_id / anypoint_platform_client_secret / nexus_username / nexus_password
+                
+    release/*:
+      - step:
+          name: Deploy to UAT
+          deployment: UAT
+          caches:
+            - maven
+          script:
+            - sed -i "s/9999/${BITBUCKET_BUILD_NUMBER}/g" ./pom.xml 
+            - mvn clean deploy -P cloudhub2 -e -DmuleDeploy -DskipTests -Danypoint.environment=UAT -Denv=uat -Denc.key=${enc_key}  --settings ./scripts/settings.xml
+           # pipeline variable : anypoint_connected_app_id / anypoint_connected_app_secret / anypoint_platform_client_id / anypoint_platform_client_secret / nexus_username / nexus_password
+      - step:
+          name: Deploy to Production
+          trigger: manual
+          deployment: PROD
+          caches:
+            - maven
+          script:
+            - sed -i "s/9999/${BITBUCKET_BUILD_NUMBER}/g" ./pom.xml 
+            - mvn clean deploy -P cloudhub2 -e -DmuleDeploy -DskipTests -Danypoint.environment=PROD -Denv=prod -Denc.key=${enc_key}  --settings ./scripts/settings.xml
+           # pipeline variable : anypoint_connected_app_id / anypoint_connected_app_secret / anypoint_platform_client_id / anypoint_platform_client_secret / nexus_username / nexus_password
+
+
+  custom: # Pipelines that can only be triggered manually
+    deploy-to-dev:
+      - step:
+          name: Deploy to DEV CloudHub2.0 Runtime
+          deployment: DEV
+          caches:
+            - maven
+          script:
+            - sed -i "s/9999/${BITBUCKET_BUILD_NUMBER}/g" ./pom.xml  # update application version using 'BITBUCKET_BUILD_NUMBER'
+            - mvn clean -P cloudhub2 --settings ./scripts/settings.xml # separate 'mvn clean' to avoid 'object generation error in .git directory' error
+            - mvn test -P cloudhub2 -Denv=dev -Denc.key=${enc_key} --settings ./scripts/settings.xml
+            - mvn clean deploy -P cloudhub2 -Denv=dev -Denc.key=${enc_key} --settings ./scripts/settings.xml
+            - mvn clean deploy -P cloudhub2 -e -DmuleDeploy -DskipTests -Danypoint.environment=DEV -Denv=dev -Denc.key=${enc_key} --settings ./scripts/settings.xml
+          # pipeline variable : anypoint_connected_app_id / anypoint_connected_app_secret / anypoint_platform_client_id / anypoint_platform_client_secret / nexus_username / nexus_password
+
+    apply-api-policy:
+      - step:
+          name: Extract policy info
+          script:
+            - apt-get update; apt-get install -y jq
+            - export applyPolicy=`jq -r  '.applyPolicy' ./src/main/resources/api-mgr/policies/${env}/api-policy.json`
+            - export apiId=`jq -r  '.apiId' ./src/main/resources/api-mgr/policies/${env}/api-policy.json`
+            - printenv | grep -E 'applyPolicy|apiId' >> set_env.sh
+          artifacts:
+            - set_env.sh
+      - step:
+          name: Fetch Access Token
+          script:
+            - apt-get update; apt-get install -y jq
+            - curl -v --request POST --url "https://anypoint.mulesoft.com/accounts/api/v2/oauth2/token" --header 'Content-Type:application/json' --data-raw "{\"client_id\":\""${anypoint_connected_app_id}\"",\"client_secret\":\""${anypoint_connected_app_secret}\"",\"grant_type\":\"client_credentials\"}" > token.json
+            - export bearerToken=`jq -r '.access_token' token.json`
+            - printenv | grep bearerToken >> set_env.sh
+          artifacts:
+            - set_env.sh                      
+      - step:
+          name: Fetch existing policy info & Remove duplicated policy
+          script:
+            - source set_env.sh
+            - apt-get update; apt-get install -y jq
+            - curl -H "Authorization:Bearer $bearerToken"  "https://anypoint.mulesoft.com/apimanager/api/v1/organizations/${organizationId}/environments/${environmentId}/apis/${apiId}/policies?fullInfo=false" > current-policies.json
+            - ls ./src/main/resources/api-mgr/policies/${env}  | grep -v policy-templates | grep -v api-policy.json | sed "s/.json//g"  | sort > new-policy-names.txt
+            - jq -r '.[] | .assetId' current-policies.json | sort > current-policy-names.txt
+            - awk 'NR==FNR{a[$1]++;next} a[$1] ' new-policy-names.txt current-policy-names.txt > duplicated-policy-names.txt
+            - sed -i '/^$/d' duplicated-policy-names.txt
+            - if [[ -s duplicated-policy-names.txt ]]; then export duplicatedPolicyNames=`cat duplicated-policy-names.txt` ; fi
+            - if [[ -s duplicated-policy-names.txt ]]; then echo `for currPolicy in $duplicatedPolicyNames ; do jq -r --arg policyName $currPolicy '.[] | select(.assetId==$policyName) | .id' current-policies.json >> duplicated-policy-ids.txt ; done` ; fi
+            - if [[ -s duplicated-policy-names.txt ]]; then sed -i '/^$/d' duplicated-policy-ids.txt ; fi
+            - if [[ -s duplicated-policy-names.txt ]]; then export duplicatedPolicyIds=`cat duplicated-policy-ids.txt` ; fi
+            - echo "removing "$duplicatedPolicyNames"("$duplicatedPolicyIds") for update"
+            - if [[ $duplicatedPolicyIds ]] ; then echo `for currPolicy in $duplicatedPolicyIds ; do curl -X DELETE -H "Authorization:Bearer $bearerToken" "https://anypoint.mulesoft.com/apimanager/api/v1/organizations/${organizationId}/environments/${environmentId}/apis/${apiId}/policies/${currPolicy}" >> removal_log.txt ; done`; fi
+            - if [[ -s duplicated-policy-names.txt ]]; then cat removal_log.txt ; else echo "No duplicated policy found"; fi
+          artifacts:
+            - set_env.sh
+      - step:
+          name: Apply new policies
+          script:
+            - source set_env.sh
+            - apt-get update; apt-get install -y jq
+            - |
+              export newPolicyFiles=`ls ./src/main/resources/api-mgr/policies/${env}  | grep -v policy-templates | grep -v api-policy.json`
+              for newPolicyFile in $newPolicyFiles ; do curl -X POST -H "Content-Type: application/json" -H "Authorization:Bearer $bearerToken" -d @./src/main/resources/api-mgr/policies/${env}/${newPolicyFile} "https://anypoint.mulesoft.com/apimanager/api/v1/organizations/${organizationId}/environments/${environmentId}/apis/${apiId}/policies" ; done
+          artifacts:
+            - set_env.sh
+
+    encrypt-string: # Convert string to encrypted text
+      - variables:
+        - name: NormalText
+      - step:
+          name: Encrypt String
+          script:
+            - export encrypted_text=`java -cp ./scripts/secure-properties-tool.jar com.mulesoft.tools.SecurePropertiesTool string encrypt "AES" "CBC" ${enc_key} ${NormalText}`
+            - echo ${encrypted_text}
+
+    encrypt-properties: # Add encrypted credentials to properties-{env}.yaml
+      - step:
+          name: Extract properties values
+          script:
+            - apt-get update
+            - apt-get install -y jq
+            - wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/bin/yq && chmod +x /usr/bin/yq
+            - apt-get install -y libxml2-utils
+            - xmllint --xpath "/*[local-name()='project']/*[local-name()='artifactId']/text()" pom.xml
+            - export applicationName=`xmllint --xpath "/*[local-name()='project']/*[local-name()='artifactId']/text()" pom.xml`
+            - yq '.. | select(. == "secure::*")' ./src/main/resources/properties/${applicationName}.${env}.yaml > encrypt_value_list.txt
+            #- bash ./scripts/configure-secure-props.sh "AES" "CBC"
+            - bash ./scripts/configure-secure-props.sh "AES" "CBC"
+            - sleep 3
+            - cat ./src/main/resources/properties/${applicationName}.${env}.yaml
+            - rm encrypt_value_list.txt
+            
